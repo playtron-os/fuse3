@@ -80,6 +80,50 @@ impl MountHandle {
             .inner_unmount()
             .await
     }
+
+    /// A handle for invalidating the kernel's cached attributes, directory entries,
+    /// and data for a mounted inode (`FUSE_NOTIFY_INVAL_INODE` / `_ENTRY`). This lets
+    /// a filesystem use a longer attribute/entry timeout while still pushing fresh
+    /// state when the backing data changes out-of-band.
+    ///
+    /// Returns a cheap, clonable [`Notifier`] you can hold wherever you detect
+    /// changes (independent of this handle's lifetime). `None` only on a mount path
+    /// that did not prepare a notifier.
+    pub fn notifier(&self) -> Option<Notifier> {
+        self.inner
+            .as_ref()?
+            .notifier_sender
+            .as_ref()
+            .map(|sender| Notifier {
+                sender: sender.clone(),
+            })
+    }
+}
+
+/// A cheap, `Clone + Send + Sync` handle for invalidating the kernel cache of a
+/// mounted filesystem. Obtain it from [`MountHandle::notifier`].
+#[derive(Debug, Clone)]
+pub struct Notifier {
+    sender: Arc<ResponseSender>,
+}
+
+impl Notifier {
+    /// Invalidate cached attributes for `inode` (and the data range
+    /// `[offset, offset+len)` when `len > 0`; `0`/`0` invalidates attributes only).
+    /// The next `getattr`/read is forwarded to the filesystem.
+    pub async fn invalidate_inode(&self, inode: u64, offset: i64, len: i64) {
+        Notify::new(self.sender.clone())
+            .invalid_inode(inode, offset, len)
+            .await;
+    }
+
+    /// Invalidate the cached directory entry `name` under directory `parent` (for an
+    /// out-of-band create / rename / delete).
+    pub async fn invalidate_entry(&self, parent: u64, name: std::ffi::OsString) {
+        Notify::new(self.sender.clone())
+            .invalid_entry(parent, name)
+            .await;
+    }
 }
 
 impl Drop for MountHandle {
@@ -198,6 +242,10 @@ struct MountHandleInner {
         target_os = "macos"
     ))]
     unprivileged: bool,
+    /// Response sender built eagerly at mount time so [`MountHandle::notifier`] can
+    /// hand out a [`Notify`] for kernel-cache invalidation. `None` only if a future
+    /// mount path forgets to prepare it.
+    notifier_sender: Option<Arc<ResponseSender>>,
 }
 
 impl MountHandleInner {
@@ -424,12 +472,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("mount {:?} success", mount_path);
 
+        let notifier_sender = self.prepare_response_sender();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
                 task: task::spawn(self.inner_mount()),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 unprivileged: true,
+                notifier_sender: Some(notifier_sender),
             }),
         })
     }
@@ -459,12 +509,14 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("mount {:?} success", mount_path);
 
+        let notifier_sender = self.prepare_response_sender();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
                 task: task::spawn(self.inner_mount()),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
                 unprivileged: true,
+                notifier_sender: Some(notifier_sender),
             }),
         })
     }
@@ -509,6 +561,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("mount {:?} success", mount_path);
 
+        let notifier_sender = self.prepare_response_sender();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
                 task: task::spawn(self.inner_mount()),
@@ -516,6 +569,7 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
                 destroy_notify: notify,
                 #[cfg(all(target_os = "linux", feature = "unprivileged"))]
                 unprivileged: false,
+                notifier_sender: Some(notifier_sender),
             }),
         })
     }
@@ -552,11 +606,13 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
 
         debug!("mount {:?} success", mount_path);
 
+        let notifier_sender = self.prepare_response_sender();
         Ok(MountHandle {
             inner: Some(MountHandleInner {
                 task: task::spawn(self.inner_mount()),
                 mount_path: mount_path.to_path_buf(),
                 destroy_notify: notify,
+                notifier_sender: Some(notifier_sender),
             }),
         })
     }
@@ -573,14 +629,36 @@ impl<FS: Filesystem + Send + Sync + 'static> Session<FS> {
             .expect("response_sender should be Some()")
     }
 
-    async fn inner_mount(mut self) -> IoResult<()> {
-        let fuse_write_connection = self.fuse_connection.as_ref().unwrap().clone();
-
+    /// Build the response sender eagerly (normally done in [`inner_mount`]) and stash
+    /// it on `self`, so the caller can hand a notifier to the [`MountHandle`] BEFORE
+    /// `self` is consumed by the dispatch task. Returns the shared sender.
+    ///
+    /// [`inner_mount`]: Self::inner_mount
+    fn prepare_response_sender(&mut self) -> Arc<ResponseSender> {
         let send_failed = Arc::new(async_notify::Notify::new());
-        self.response_sender.replace(Arc::new(ResponseSender {
-            send_failed: send_failed.clone(),
-            connection: fuse_write_connection,
-        }));
+        let sender = Arc::new(ResponseSender {
+            send_failed,
+            connection: self.fuse_connection.as_ref().unwrap().clone(),
+        });
+        self.response_sender.replace(sender.clone());
+        sender
+    }
+
+    async fn inner_mount(mut self) -> IoResult<()> {
+        // The response sender is normally built here, but `prepare_response_sender`
+        // may have already created it (so a notifier could be handed to MountHandle
+        // before `self` was moved into this task). Reuse it if so.
+        let send_failed = match &self.response_sender {
+            Some(sender) => sender.send_failed.clone(),
+            None => {
+                let send_failed = Arc::new(async_notify::Notify::new());
+                self.response_sender.replace(Arc::new(ResponseSender {
+                    send_failed: send_failed.clone(),
+                    connection: self.fuse_connection.as_ref().unwrap().clone(),
+                }));
+                send_failed
+            }
+        };
 
         let dispatch_task = self.dispatch().fuse();
         let mut dispatch_task = pin!(dispatch_task);
